@@ -1,0 +1,487 @@
+---
+title: "FINAL RPOJECT SPOTIFY"
+author: "Kevin Gabalebe"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(caret)
+library(e1071) # SVM
+library(nnet) # Neural net
+library(ggplot2) #EDA
+library(ROCR) #ROC 
+library(h2o) #Deep learning
+library(dplyr) 
+library(tidyr)
+library(corrplot) #Correlation matrix
+
+
+```
+
+## Data Preparation
+
+```{r cars, include=FALSE}
+summary(spotify_songs)
+dim(spotify_songs)
+str(spotify_songs)
+length(unique(spotify_songs$playlist_id))
+#Checking for duplicates
+sum(duplicated(spotify_songs))
+sum(duplicated(spotify_songs[,c("track_name","track_artist")]))
+#Seeing the list of the duplicates
+spotify_songs%>%
+  group_by(track_name, track_artist) %>%
+  summarise(n=n(),.groups="drop") %>%
+  filter(n > 1)
+
+#Removing the duplicates
+if("track_name" %in% names(spotify_songs) & "track_artist" %in% names(spotify_songs)) {
+  spotify_clean <- spotify_songs %>%
+    distinct(track_name, track_artist, .keep_all = TRUE)
+}
+#Checking for NA Values
+sum(is.na(spotify_clean))
+colSums(is.na(spotify_clean))   #Checking which columns have the NA values
+spotify_clean<- spotify_clean %>% drop_na() #Removing NA values
+sum(is.na(spotify_clean)) #Ensuring nomore NA values
+
+
+#Converting the release date to year
+spotify_clean$track_album_release_year<- as.numeric(substr(spotify_clean$track_album_release_date,1,4))
+
+#Creating a model dataset
+colnames(spotify_clean) 
+predictors<- c("track_popularity","track_album_release_year","energy","key","loudness","mode","speechiness","acousticness","instrumentalness","liveness","valence","tempo", "duration_ms") #Predictors to be used to create the new dataset
+spotify<-spotify_clean %>% 
+  dplyr::select(all_of(c("track_name","track_artist","playlist_genre","danceability", predictors))) #Creating the dataset to be used for EDA
+spotify_model<- spotify_clean %>% 
+  dplyr::select(all_of(predictors)) #Creating the dataset to be used for modelling
+
+#Creating Binary Target (Dance-ability)
+median_dance<- median(spotify$danceability,na.rm=TRUE) #Getting the median of the danceability to get a threshold
+median_dance
+spotify <- spotify %>%mutate(danceable = ifelse(danceability >= median_dance, 1, 0),danceable = factor(danceable, levels = c(0, 1))) #Adding the binary target to the dataset
+spotify_model$danceable <- spotify$danceable #Adding the danceable binary target to the modelling data
+table(spotify$danceable) #Seeing separation
+
+```
+
+##EDA
+```{r EDA, echo=FALSE}
+#Plotting the distribution of the Danceability
+ggplot(spotify, aes(x = danceability)) +
+  geom_histogram(bins = 30, fill = "steelblue", colour = "white") +         #The Histogram showing the distribution
+  geom_vline(xintercept = median_dance, colour = "red", linetype = "dashed") + #Drawing the line showiing the threshold
+  labs(title = "Distribution of Danceability",             #Title of Graph
+       subtitle = paste("Median split at:", round(median_dance, 3))) #Text showing the median
+
+#Plotting the boxplots of danceable songs and non-danceable songs
+spotify %>%
+  pivot_longer(cols = predictors, names_to = "feature", values_to = "value") %>% #Pivotting the rows,  to help draw all box-plot in one
+  ggplot(aes(x = danceable, y = value, fill = danceable)) +
+  geom_boxplot(outlier.alpha = 0.2) + #The box-plot showing the ranges of the box-plots
+  facet_wrap(~ feature, scales = "free") +#Ensures we draw multiple graphs into the space of one
+  labs(title = "Predictor Boxplots by Danceability Class") + #Title of Graph
+  theme(legend.position = "none")
+
+#Drawing a correlation matrix 
+corrplot(cor(spotify[, predictors]), 
+         method = "color", type = "lower",
+         tl.col = "black", tl.cex = 0.7)
+
+
+```
+
+##Split And Scaling Data
+
+```{r train/split and scaling, echo=FALSE}
+#Separating the train and split before building the models
+set.seed(123)  #setting seed for reproduceability
+
+trainindex<- createDataPartition(spotify_model$danceable, p=0.7, list=FALSE) #Creating a data index, where 70% of the data is training and 30% is for testing
+train_data<- spotify[trainindex,] #Partitioning the dataset, and placing all train data in the data set train_data
+test_data<- spotify[-trainindex,] #Partitioningthe data set, and placing all test data in the data set test_data
+
+#Scaling the dataset
+preproc<- preProcess(train_data[,predictors], method=c("center","scale")) #Compute the scaling and centering parameters to scale the data from the train data
+train_x<- predict(preproc,train_data[,predictors]) #Applying the parameters to the training data
+test_x<- predict(preproc, test_data[,predictors]) #Applying the parameters to the test data (to avoid information leakage we used the training parameters)
+
+train_scaled<- cbind(train_x,danceable=train_data$danceable) #Creating a new dataset with the scaled data and the danceable target
+test_scaled<- cbind(test_x,danceable=test_data$danceable) #Creating a new dataset with the scaled data and the danceable target
+
+str(train_scaled)
+```
+
+#Logistic Modelling
+```{r logistic modelling, echo=FALSE}
+glm_fit<- glm(danceable~., data=train_scaled, family=binomial) #Fitting the data with logistic regression model
+summary(glm_fit) #Getting the summary of the logistic regression model
+
+#Odds Ratios
+# Extract coefficients
+glm_coef <- coef(glm_fit)
+glm_ci <- confint(glm_fit)
+
+# Create 0.1-unit CI by scaling the log-odds and exponentiating
+glm_ci_0.1 <- exp(glm_ci * 0.1)
+
+# Renaming the colums
+colnames(glm_ci_0.1) <- c("CI0.1_lower", "CI0.1_upper")
+
+# Full Odds Ratio table
+glm_or <- data.frame(
+  OddsRatio    = exp(glm_coef),
+  OddsRatio0.1 = exp(glm_coef * 0.1),
+  CI_lower     = exp(glm_ci[,1]),
+  CI_upper     = exp(glm_ci[,2]),
+  CI0.1_lower  = glm_ci_0.1[,1],
+  CI0.1_upper  = glm_ci_0.1[,2]
+)
+
+glm_or
+
+
+#Variable Importance
+# Get coefficient table from summary
+glm_sum <- summary(glm_fit)$coefficients
+
+# Drop intercept
+glm_coef_tbl <- glm_sum[-1, , drop = FALSE]  # removing "(Intercept)"
+
+#Forming a table with estimates 
+glm_vi <- data.frame( 
+  Variable = rownames(glm_coef_tbl),
+  Estimate = glm_coef_tbl[,"Estimate"],
+  Z_value  = glm_coef_tbl[,"z value"],
+  Abs_Z    = abs(glm_coef_tbl[,"z value"])
+)
+
+# Sort by absolute z-value (importance- largest to smallest)
+glm_vi <- glm_vi[order(-glm_vi$Abs_Z), ] 
+
+#Plotting the z- values from Largest to smallest
+ggplot(glm_vi, aes(x = reorder(Variable, Abs_Z), y = Abs_Z)) +geom_col(fill = "blue") +coord_flip() +labs( title = "GLM Variable Importance (|z-value|)",x = "Predictor",y = "Importance (absolute z-value)")
+
+#Predicting
+glm_prob<- predict(glm_fit, newdata=test_scaled,type="response") #Using the model to calculate probability of a song being danceable
+
+#Evaluating model
+glm_pred_class<- ifelse(glm_prob>= 0.5, 1 ,0) #Classifying songs with a prob >0.5 as being 1 (dance-able)
+glm_pred_class<- factor(glm_pred_class, levels=levels(test_data$danceable)) #Making it a factor
+
+# Confusion matrix
+glm_cm <- confusionMatrix(glm_pred_class, test_data$danceable, positive = "1") #Making a confusion matrix showing the predicted danceable songs vs actual danceable songs
+glm_cm
+
+# ROC 
+glm_pred_obj<- prediction(glm_prob, test_data$danceable) # Create the prediction object (probabilities + actual outcomes)
+glm_perf_roc<- performance(glm_pred_obj, "tpr", "fpr") # Creating performance object for ROC curve (TPR vs FPR)
+
+#AUC
+glm_perf_auc <- performance(glm_pred_obj, "auc") #Calculating the Area Under Curve
+glm_auc<- glm_perf_auc@y.values[[1]] #Extracting the Area Under Curve
+
+#ROC Curve
+plot(glm_perf_roc, col="blue", lwd=2, main="ROC Curve- Logistic Regression",xlab = "False Positive Rate ",ylab = "True Positive Rate")
+segments(0,0,1,1, lty=2,col="gray") #Diagonal reference line
+text(0.6, 0.2, paste("AUC =", round(glm_auc, 3)))
+
+#Store the results
+glm_results <- data.frame(
+  Model       = "GLM",
+  Accuracy    = glm_cm$overall["Accuracy"],
+  Sensitivity = glm_cm$byClass["Sensitivity"],
+  Specificity = glm_cm$byClass["Specificity"],
+  AUC         = as.numeric(glm_auc)
+)
+glm_results
+
+
+```
+
+
+##SVM (Radial)
+```{r svm, echo=FALSE}
+set.seed(123)
+#Tuning the svm to get the best parameters
+tuned_svm<- tune.svm(danceable~., data= train_scaled, kernel="radial",cost=c(0.1,1,10),gamma=c(0.01,0.05,1), probability=TRUE, tunecontrol= tune.control(cross=5)) 
+summary(tuned_svm)  #Show performance for each cost/gamma combination
+svm_fit<- tuned_svm$best.model #Extracting the best model
+summary(svm_fit)
+
+svm_pred<- predict(svm_fit, newdata=test_scaled, probability=TRUE) #Predicting class probabilities using the test data
+svm_prob<- attr(svm_pred,"probabilities")[,"1"] #Extract probability of class "1"
+
+#Evaluating model
+svm_pred_class<- ifelse(svm_prob>=0.5,1,0) #Classifying songs with a prob >0.5 as being 1 (danceable)
+svm_pred_class<- factor(svm_pred_class,levels=levels(test_data$danceable))#Making it a factor
+
+#Confusion matrix
+svm_cm<- confusionMatrix(svm_pred_class, test_data$danceable, positive="1") #Making a confusion matrix showing the predicted danceable songs vs actual danceable songs
+svm_cm
+
+#ROC
+svm_pred_obj<- prediction(svm_prob, test_data$danceable) #Creating the prediction object (probabilities + actual outcomes)
+svm_perf_roc<- performance(svm_pred_obj,"tpr","fpr") #Creating performance object for ROC curve (TPR vs FPR)
+
+#AUC
+svm_perf_auc<- performance(svm_pred_obj,"auc") #Calculating the Area Under Curve
+svm_auc<- svm_perf_auc@y.values[[1]] #Extracting the Area Under Curve
+
+#ROC Curve
+plot(svm_perf_roc,col="purple", lwd=2, main="ROC - SVM(Radial)", xlab="False Positive Rate",ylab="True Positive Rate")
+segments(0,0,1,1, lty=2, col="gray") #Diagonal reference line
+text(0.6,0.2, paste("AUC=", round(svm_auc,3)))
+ 
+#Store the results
+svm_results <- data.frame(
+  Model       = "SVM (Radial)",
+  Accuracy    = svm_cm$overall["Accuracy"],
+  Sensitivity = svm_cm$byClass["Sensitivity"],
+  Specificity = svm_cm$byClass["Specificity"],
+  AUC         = as.numeric(svm_auc)
+)
+svm_results
+
+# Permutation importance
+var_imp <- data.frame(Variable = predictors, Importance = NA)
+
+for (v in predictors) {
+  test_perm <- test_scaled
+  test_perm[,v] <- sample(test_perm[,v])  # Permute values
+  
+  perm_pred <- predict(svm_fit, newdata=test_perm, probability=TRUE)
+  perm_prob <- attr(perm_pred, "probabilities")[,"1"]
+  
+  perm_auc <- performance(prediction(perm_prob, test_data$danceable), "auc")@y.values[[1]]
+  
+  var_imp[var_imp$Variable == v, "Importance"] <- svm_auc - perm_auc
+}
+
+var_imp <- var_imp[order(-var_imp$Importance), ]
+var_imp
+
+
+ggplot(var_imp, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "blue") +
+  coord_flip() +
+  labs(title = "SVM Variable Importance (Permutation-Based)",
+       x = "Predictor",
+       y = "Importance (Drop in AUC)")
+```
+
+##Neural Network
+```{r nnet,echo=FALSE}
+set.seed(123)
+
+#Looking for best neural network model
+sizes<- c(3,5,7) #Choices of network sizes
+decays<- c(0,0.01,0.001) #Choices of decay values
+
+#Initializing the model,error,size and decay 
+best_model_nn<- NULL
+best_err<- Inf
+best_size<- NA
+best_decay<- NA
+
+#Looping the trial and error to find the best model
+for (s in sizes){
+  for (d in decays){
+    
+    nn_tmp<- nnet(danceable~., data= train_scaled, size=s, decay=d, maxit=200,trace=FALSE)
+    
+    #Extracting the training predictions
+    p_tmp<- predict(nn_tmp, newdata=train_scaled, type="raw")
+    
+    #Extracting the probability of a song being danceable if outputted as a vector or as matrice
+    if (is.matrix(p_tmp)){
+      prob1<- as.numeric(p_tmp[,ncol(p_tmp)])
+    } else {
+      prob1<- as.numeric(p_tmp)
+    }
+    
+    pred_tmp<- ifelse(prob1 >= 0.5,1,0) #Classifying songs with a prob >0.5 as being 1 (danceable)
+    pred_tmp<- factor(pred_tmp, levels=levels(train_scaled$danceable)) #Making it a factor
+    
+    err<- mean(pred_tmp != train_scaled$danceable) #Getting the mean of all the predicted values that are not equal to the actual values
+    
+    if (err <best_err){
+      best_err <- err
+      best_model_nn<- nn_tmp
+      best_size<- s
+      best_decay <- d
+    }
+    }
+    
+}
+
+#Best tuned neural network model
+nnet_fit<- best_model_nn
+best_size
+best_decay
+best_err
+
+#Evaluating model
+nnet_prob_raw<- predict(nnet_fit, newdata=test_scaled, type="raw")
+
+if (is.matrix(nnet_prob_raw)){
+  nnet_prob<- as.numeric(nnet_prob_raw[,ncol(nnet_prob_raw)])
+} else{ 
+  nnet_prob<- as.numeric(nnet_prob_raw)
+}
+
+nnet_pred_class<- ifelse(nnet_prob>= 0.5, 1,0) #Classifying songs with a prob >0.5 as being 1 (danceable)
+nnet_pred_class<- factor(nnet_pred_class, levels=levels(test_data$danceable)) #Making it a factor
+
+#Confusion Matrix 
+nnet_cm<- confusionMatrix(nnet_pred_class, test_data$danceable, positive="1") #Making a confusion matrix showing the predicted danceable songs vs actual danceable songs
+nnet_cm
+
+#ROC
+nnet_pred_obj<- prediction(nnet_prob, test_data$danceable) #Creating the prediction object (probabilities + actual outcomes)
+nnet_perf_roc<- performance(nnet_pred_obj, "tpr","fpr") #Creating performance object for ROC curve (TPR vs FPR)
+
+#AUC
+nnet_perf_auc<- performance(nnet_pred_obj,"auc")  #Calculating the Area Under Curve
+nnet_auc<- nnet_perf_auc@y.values[[1]]  #Extracting the Area Under Curve
+
+#ROC Curve
+plot(nnet_perf_roc, col="darkgreen", lwd=2, main="ROC Curve - Neural Network (nnet)", xlab="False Positive Rate", ylab="True Positive Rate")
+segments(0,0,1,1, lty=2, col="gray")  #Diagonal reference line
+text(0.6,0.2, paste("AUC=", round(nnet_auc,3)))
+
+#Store the results
+nnet_results <- data.frame(
+  Model       = "Neural Network",
+  Accuracy    = nnet_cm$overall["Accuracy"],
+  Sensitivity = nnet_cm$byClass["Sensitivity"],
+  Specificity = nnet_cm$byClass["Specificity"],
+  AUC         = as.numeric(nnet_auc)
+)
+nnet_results
+
+# Permutation importance
+nnet_var_imp <- data.frame(Variable = predictors, Importance = NA)
+
+# Loop through predictors and permute each
+for (v in predictors) {
+  test_perm <- test_scaled
+  test_perm[, v] <- sample(test_perm[, v])  # permute values column
+  
+  perm_prob_raw <- predict(nnet_fit, newdata = test_perm, type="raw")
+  perm_prob <- as.numeric(perm_prob_raw)
+  
+  perm_auc <- performance(prediction(perm_prob, test_data$danceable), "auc")@y.values[[1]]
+  
+  # Importance = drop in AUC
+  nnet_var_imp[nnet_var_imp$Variable == v, "Importance"] <- nnet_auc - perm_auc
+}
+
+# Sort by importance
+nnet_var_imp <- nnet_var_imp[order(-nnet_var_imp$Importance), ]
+nnet_var_imp
+ggplot(nnet_var_imp, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "blue") +
+  coord_flip() +
+  labs(title = "Neural Network Variable Importance (Permutation-Based)",
+       x = "Predictor",
+       y = "Importance (Drop in AUC)")
+```
+
+#Deep Learning (H2O)
+```{r deeplearning, echo=FALSE}
+set.seed(123)
+#Initializing H2O
+h2o.init(max_mem_size="2G")
+
+#Converting data to H2O frames
+train_h2o<- as.h2o(train_scaled)
+test_h2o<- as.h2o(test_scaled)
+
+y<- "danceable" 
+x<- setdiff(colnames(train_scaled), "danceable")
+
+#Building deep learning model with 3 hidden layers
+dl_fit<- h2o.deeplearning(x=x,y=y, training_frame=train_h2o, 
+                          hidden=c(128,64,32), 
+                          activation="RectifierWithDropout", 
+                          input_dropout_ratio=0.1,
+                          hidden_dropout_ratios =c(0.3,0.3,0.3),
+                          epochs=50,
+                          seed=123)
+dl_fit
+
+# Predict on test data
+dl_pred <- h2o.predict(dl_fit, test_h2o)  #Predicting class probabilities using the test data
+dl_prob <- as.vector(dl_pred[,"p1"]) #Extract probability of class "1"
+
+# Class labels
+dl_pred_class <- ifelse(dl_prob >= 0.5, "1", "0")  #Classifying songs with a prob >0.5 as being 1 (danceable
+dl_pred_class <- factor(dl_pred_class, levels = levels(test_data$danceable)) #Making it a factor
+
+# Confusion matrix
+dl_cm <- confusionMatrix(dl_pred_class, test_data$danceable, positive = "1") #Making a confusion matrix showing the predicted danceable songs vs actual danceable songs
+dl_cm
+
+# ROC 
+dl_pred_obj <- prediction(dl_prob, test_data$danceable) #Creating the prediction object (probabilities + actual outcomes)
+dl_perf_roc <- performance(dl_pred_obj, "tpr", "fpr") #Creating performance object for ROC curve (TPR vs FPR)
+
+#AUC
+dl_perf_auc <- performance(dl_pred_obj, "auc") #Calculating the Area Under Curve
+dl_auc <- as.numeric(dl_perf_auc@y.values[[1]]) #Extracting the Area Under Curve
+
+# ROC plot
+plot(dl_perf_roc, col = "red", lwd = 2,main = "ROC Curve - Deep Learning (H2O)",xlab = "False Positive Rate", ylab = "True Positive Rate")
+segments(0,0,1,1, lty=2, col="gray") #Diagonal reference line
+text(0.6, 0.2, paste("AUC =", round(dl_auc, 3)))
+
+# Store model results
+dl_results <- data.frame(
+  Model       = "Deep Learning (H2O)",
+  Accuracy    = dl_cm$overall["Accuracy"],
+  Sensitivity = dl_cm$byClass["Sensitivity"],
+  Specificity = dl_cm$byClass["Specificity"],
+  AUC         = dl_auc
+)
+
+dl_results
+
+h2o.varimp(dl_fit)
+h2o.varimp_plot(dl_fit)
+```
+
+#Comparison
+```{r comparison, echo=FALSE}
+#Summary of model results
+model_results<- rbind(
+  glm_results,
+  svm_results,
+  nnet_results,
+  dl_results
+)
+model_results
+
+#Plotting all ROC Curves
+# Plot all ROC curves on same graph
+plot(glm_perf_roc, col="steelblue",   lwd=2, main="ROC Curves - All Models",  xlab="False Positive Rate", ylab="True Positive Rate")
+plot(svm_perf_roc,  col="purple", lwd=2, add=TRUE)
+plot(nnet_perf_roc, col="darkgreen",lwd=2, add=TRUE)
+plot(dl_perf_roc,  col="red",  lwd=2, add=TRUE)
+segments(0,0,1,1, lty=2, col="gray")
+
+legend("bottomright",
+      legend = c(
+         paste("Logistic Regression  (AUC =", round(glm_auc, 3), ")"),
+         paste("SVM (Radial Kernel) (AUC =", round(svm_auc, 3), ")"),
+         paste("Neural Network  (AUC =", round(nnet_auc, 3), ")"),
+         paste("Deep Learning (H2O)  (AUC =", round(dl_auc, 3), ")")
+       ),
+       col    = c("steelblue", "purple", "darkgreen", "red"),
+       lwd    = 2,
+       bty    = "n")
+```
